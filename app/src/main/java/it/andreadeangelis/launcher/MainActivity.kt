@@ -141,9 +141,9 @@ data class Hit(
 
 data class Suggestion(val app: AppEntry, val why: String)
 
-/** Modalità della home: cambiano le app suggerite. */
-enum class Mode(val label: String, val title: String) {
-    Mattina("Mattina", "MATTINA"), Giorno("Giorno", "GIORNO"), Set("Set", "SUL SET"), Sera("Sera", "SERA")
+/** Attività in corso: decide le 3 app della sezione "Attività". */
+enum class Task(val label: String, val title: String) {
+    Auto("Auto", "AUTO"), Ufficio("Ufficio", "UFFICIO"), Set("Set", "SET"), Gara("Gara", "GARA"), Relax("Relax", "RELAX")
 }
 
 class MainActivity : ComponentActivity() {
@@ -156,7 +156,9 @@ class MainActivity : ComponentActivity() {
     private val calendarOk = mutableStateOf(false)
     private val mediaOk = mutableStateOf(false)
     private val playing = mutableStateOf<NowPlaying?>(null)
-    private val modeOverride = mutableStateOf<Mode?>(null)
+    private val task = mutableStateOf(Task.Auto)
+    private val nextEventTitle = mutableStateOf("")
+    private val nextEventSoon = mutableStateOf(false)
     private val usageTick = mutableIntStateOf(0)
     private val resetTick = mutableIntStateOf(0)
     private val enterTick = mutableIntStateOf(0)
@@ -225,6 +227,8 @@ class MainActivity : ComponentActivity() {
             calendarOk.value = CalendarRepo.granted(this@MainActivity)
             mediaOk.value = Media.hasAccess(this@MainActivity)
             val ev = withContext(Dispatchers.IO) { CalendarRepo.next(this@MainActivity) }
+            nextEventTitle.value = ev?.title ?: ""
+            nextEventSoon.value = ev != null && ev.begin - System.currentTimeMillis() < 3 * 3600 * 1000L
             nextEvent.value = ev?.let { "${SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(it.begin))} · ${it.title}" }
         }
     }
@@ -329,13 +333,17 @@ class MainActivity : ComponentActivity() {
         return "Sveglia " + SimpleDateFormat(fmt, Locale.ITALY).format(Date(t))
     }
 
-    private fun autoMode(): Mode {
-        val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
-        return when (h) {
-            in 5..11 -> Mode.Mattina
-            in 12..18 -> Mode.Giorno
-            else -> Mode.Sera
+    /** In Auto: prima il calendario, poi l'ora del giorno. */
+    private fun resolveTask(): Pair<Task, String> {
+        val t = task.value
+        if (t != Task.Auto) return t to "scelta da te"
+        val title = normalize(nextEventTitle.value)
+        if (nextEventSoon.value && title.isNotEmpty()) {
+            if (listOf("gara", "wsk", "kart", "trofeo", "circuito", "race").any { title.contains(it) }) return Task.Gara to "dal calendario"
+            if (listOf("ripres", "set", "shoot", "video", "foto", "sopralluogo").any { title.contains(it) }) return Task.Set to "dal calendario"
         }
+        val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        return if (h in 8..18) Task.Ufficio to "dall'ora" else Task.Relax to "dall'ora"
     }
 
     private fun find(spec: String): AppEntry? {
@@ -344,40 +352,21 @@ class MainActivity : ComponentActivity() {
         else list.firstOrNull { it.label.equals(spec.removePrefix("label:"), ignoreCase = true) }
     }
 
-    private fun defaults(m: Mode): List<Pair<String, String>> = when (m) {
-        Mode.Mattina -> listOf(
-            "pkg:com.google.android.calendar" to "La tua giornata",
-            "pkg:com.anthropic.claude" to "Il tuo assistente",
-            "pkg:notion.id" to "Note e progetti",
-        )
-        Mode.Giorno -> listOf(
-            "label:AndreaOS" to "Lavori e clienti",
-            "pkg:com.google.android.apps.docs" to "I tuoi file",
-            "pkg:com.google.android.gm" to "Posta",
-        )
-        Mode.Set -> listOf(
-            "pkg:com.android.camera" to "Riprese veloci",
-            "pkg:dji.go.v5" to "Drone",
-            "label:Race Tracker" to "Gara in corso",
-        )
-        Mode.Sera -> listOf(
-            "pkg:com.apple.android.music" to "Riprendi l'ascolto",
-            "pkg:com.instagram.android" to "Social",
-            "pkg:com.shazam.android" to "Riconosci un brano",
-        )
+    private fun defaults(t: Task): List<String> = when (t) {
+        Task.Ufficio -> listOf("label:AndreaOS", "pkg:com.google.android.gm", "pkg:com.google.android.apps.docs", "pkg:com.google.android.calendar")
+        Task.Set -> listOf("pkg:com.android.camera", "pkg:dji.go.v5", "pkg:jp.co.sony.ips.portalapp", "pkg:com.miui.gallery")
+        Task.Gara -> listOf("label:Race Tracker", "pkg:com.android.camera", "pkg:dji.go.v5", "label:RT Prova")
+        Task.Relax -> listOf("pkg:com.instagram.android", "pkg:com.apple.android.music", "pkg:com.google.android.youtube", "pkg:com.android.chrome")
+        Task.Auto -> emptyList()
     }
 
-    private fun suggestions(m: Mode): List<Suggestion> {
-        val out = mutableListOf<Suggestion>()
-        if (m != Mode.Set) {
-            Usage.top(this, 3).forEach { pkg ->
-                apps.value.firstOrNull { it.pkg == pkg }?.let { out += Suggestion(it, "Usata spesso a quest'ora") }
-            }
+    private fun activityApps(t: Task): List<AppEntry> {
+        val out = mutableListOf<AppEntry>()
+        if (task.value == Task.Auto) {
+            Usage.top(this, 2).forEach { pkg -> apps.value.firstOrNull { it.pkg == pkg }?.let { out += it } }
         }
-        defaults(m).forEach { (spec, why) ->
-            if (out.size < 3) find(spec)?.let { a -> if (out.none { it.app.pkg == a.pkg }) out += Suggestion(a, why) }
-        }
-        return out.take(3)
+        defaults(t).forEach { spec -> find(spec)?.let { a -> if (out.none { it.pkg == a.pkg }) out += a } }
+        return out.take(4)
     }
 
     private fun search(query: String): List<Hit> {
@@ -411,7 +400,6 @@ class MainActivity : ComponentActivity() {
             searchOpen = false
             drawerOpen = false
             railLetter = null
-            modeOverride.value = null
         }
         BackHandler(enabled = searchOpen || drawerOpen || railLetter != null) {
             when {
@@ -462,11 +450,13 @@ class MainActivity : ComponentActivity() {
                         ) { _, dy -> total += dy }
                     }
             ) {
-                ModeChips()
-                Spacer(Modifier.height(26.dp))
+                TaskChips()
+                Spacer(Modifier.height(20.dp))
                 ClockBlock()
                 Spacer(Modifier.weight(1f))
-                NowBlock()
+                Essentials()
+                Spacer(Modifier.height(18.dp))
+                ActivityRow()
                 Spacer(Modifier.height(14.dp))
                 MusicRow()
                 Spacer(Modifier.height(14.dp))
@@ -490,22 +480,22 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ModeChips() {
-        val current = modeOverride.value ?: autoMode()
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Mode.values().forEach { m ->
-                val on = m == current
+    private fun TaskChips() {
+        val current = task.value
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Task.values().forEach { t ->
+                val on = t == current
                 Box(
                     Modifier
-                        .height(36.dp)
-                        .clip(RoundedCornerShape(18.dp))
+                        .height(34.dp)
+                        .clip(RoundedCornerShape(17.dp))
                         .background(if (on) Ink else Color.Transparent)
-                        .border(1.dp, if (on) Ink else Color(0x24FFFFFF), RoundedCornerShape(18.dp))
-                        .clickable { modeOverride.value = if (m == autoMode()) null else m }
-                        .padding(horizontal = 12.dp),
+                        .border(1.dp, if (on) Ink else Color(0x24FFFFFF), RoundedCornerShape(17.dp))
+                        .clickable { task.value = t; usageTick.intValue = usageTick.intValue + 1 }
+                        .padding(horizontal = 10.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text(m.label, fontFamily = Mono, fontSize = 12.sp, letterSpacing = 0.5.sp, color = if (on) Night else Muted)
+                    Text(t.label, fontFamily = Mono, fontSize = 11.sp, color = if (on) Night else Muted)
                 }
             }
         }
@@ -522,7 +512,7 @@ class MainActivity : ComponentActivity() {
         }
         Text(
             SimpleDateFormat("HH:mm", Locale.ITALY).format(now),
-            fontSize = 104.sp, fontWeight = FontWeight.Light, letterSpacing = (-5).sp, lineHeight = 100.sp,
+            fontSize = 88.sp, fontWeight = FontWeight.Light, letterSpacing = (-4).sp, lineHeight = 86.sp,
         )
         Spacer(Modifier.height(10.dp))
         Text(
@@ -551,67 +541,66 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun NowBlock() {
-        val m = modeOverride.value ?: autoMode()
-        val tick = usageTick.intValue
-        val list = remember(m, apps.value, tick) { suggestions(m) }
-        Text("ADESSO · ${m.title}", fontFamily = Mono, fontSize = 11.sp, letterSpacing = 2.sp, color = Dim)
+    private fun Essentials() {
+        val byPkg = apps.value.associateBy { it.pkg }
+        val list = pinned.value.mapNotNull { byPkg[it] }
+        if (list.isEmpty()) return
+        Text("ESSENZIALI", fontFamily = Mono, fontSize = 11.sp, letterSpacing = 2.sp, color = Dim)
         Spacer(Modifier.height(10.dp))
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            list.forEach { s -> SuggestionCard(s) }
-        }
-        if (pinned.value.isNotEmpty()) {
-            Spacer(Modifier.height(12.dp))
-            val byPkg = apps.value.associateBy { it.pkg }
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                pinned.value.mapNotNull { byPkg[it] }.take(6).forEach { a -> PinnedDot(a) }
+        list.chunked(4).forEach { row ->
+            Row(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
+                row.forEach { a -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { AppIcon(a, 52, true) } }
+                repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
     }
 
     @Composable
-    private fun SuggestionCard(s: Suggestion) {
+    private fun ActivityRow() {
+        val tick = usageTick.intValue
+        val (t, why) = resolveTask()
+        val list = remember(t, apps.value, tick) { activityApps(t) }
+        val shape = RoundedCornerShape(20.dp)
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .clip(shape)
+                .background(Glass)
+                .border(1.dp, GlassLine, shape)
+                .padding(horizontal = 12.dp, vertical = 12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("ATTIVITÀ · ${t.title}", fontFamily = Mono, fontSize = 11.sp, letterSpacing = 2.sp, color = Accent, modifier = Modifier.weight(1f))
+                Text(why, fontFamily = Mono, fontSize = 10.sp, color = Dim)
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth()) {
+                list.forEach { a -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { AppIcon(a, 44, true) } }
+                repeat((4 - list.size).coerceAtLeast(0)) { Spacer(Modifier.weight(1f)) }
+            }
+        }
+    }
+
+    @Composable
+    private fun AppIcon(a: AppEntry, sizeDp: Int, label: Boolean) {
         var menu by remember { mutableStateOf(false) }
         val bounds = remember { mutableStateOf<Rect?>(null) }
-        val shape = RoundedCornerShape(18.dp)
         Box {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .height(62.dp)
+                    .width(76.dp)
                     .onGloballyPositioned { bounds.value = it.boundsInWindow() }
-                    .clip(shape)
-                    .background(Glass)
-                    .border(1.dp, GlassLine, shape)
-                    .combinedClickable(onClick = { markFrom(bounds.value); launch(s.app) }, onLongClick = { menu = true })
-                    .padding(horizontal = 12.dp),
+                    .clip(RoundedCornerShape(14.dp))
+                    .combinedClickable(onClick = { markFrom(bounds.value); launch(a) }, onLongClick = { menu = true })
+                    .padding(vertical = 4.dp),
             ) {
-                Image(s.app.icon, contentDescription = null, modifier = Modifier.size(38.dp))
-                Spacer(Modifier.width(14.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(s.app.label, fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(s.why, fontFamily = Mono, fontSize = 11.sp, color = Dim, maxLines = 1)
+                Image(a.icon, contentDescription = a.label, modifier = Modifier.size(sizeDp.dp))
+                if (label) {
+                    Spacer(Modifier.height(5.dp))
+                    Text(a.label, fontSize = 11.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                Chevron()
             }
-            AppMenu(s.app, menu) { menu = false }
-        }
-    }
-
-    @Composable
-    private fun PinnedDot(a: AppEntry) {
-        var menu by remember { mutableStateOf(false) }
-        val bounds = remember { mutableStateOf<Rect?>(null) }
-        Box {
-            Image(
-                a.icon, contentDescription = a.label,
-                modifier = Modifier
-                    .size(44.dp)
-                    .onGloballyPositioned { bounds.value = it.boundsInWindow() }
-                    .clip(RoundedCornerShape(12.dp))
-                    .combinedClickable(onClick = { markFrom(bounds.value); launch(a) }, onLongClick = { menu = true }),
-            )
             AppMenu(a, menu) { menu = false }
         }
     }
@@ -983,7 +972,7 @@ class MainActivity : ComponentActivity() {
         DropdownMenu(expanded = open, onDismissRequest = onDismiss) {
             val isPinned = a.pkg in pinned.value
             DropdownMenuItem(
-                text = { Text(if (isPinned) "Rimuovi dalle fissate" else "Fissa nella home") },
+                text = { Text(if (isPinned) "Rimuovi dagli essenziali" else "Aggiungi agli essenziali") },
                 onClick = { togglePin(a.pkg); onDismiss() },
             )
             DropdownMenuItem(text = { Text("Info app") }, onClick = { appInfo(a.pkg); onDismiss() })

@@ -34,9 +34,9 @@ object AppStore {
         "pkg:notion.id",
         "pkg:com.google.android.apps.docs",
         "pkg:com.google.android.calendar",
+        "pkg:com.apple.android.music",
+        "pkg:com.shazam.android",
         "pkg:com.instagram.android",
-        "label:Race Tracker",
-        "pkg:com.android.chrome",
     )
 
     fun load(c: Context): List<AppEntry> {
@@ -80,7 +80,7 @@ object AppStore {
 
     fun pinned(c: Context, apps: List<AppEntry>): List<String> {
         val p = prefs(c)
-        val saved = p.getString("pinned", null)
+        val saved = p.getString("essentials", null)
         if (saved != null) return saved.split("|").filter { it.isNotBlank() }
         if (apps.isEmpty()) return emptyList()
         val resolved = DEFAULT_PINNED.mapNotNull { m ->
@@ -95,6 +95,6 @@ object AppStore {
     }
 
     fun setPinned(c: Context, list: List<String>) {
-        prefs(c).edit().putString("pinned", list.joinToString("|")).apply()
+        prefs(c).edit().putString("essentials", list.joinToString("|")).apply()
     }
 }
