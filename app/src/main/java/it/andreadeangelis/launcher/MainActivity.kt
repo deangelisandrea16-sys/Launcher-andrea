@@ -4,6 +4,7 @@ package it.andreadeangelis.launcher
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.ActivityOptions
 import android.app.AlarmManager
 import android.content.Intent
 import android.media.AudioManager
@@ -20,6 +21,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -80,6 +83,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -152,6 +159,16 @@ class MainActivity : ComponentActivity() {
     private val modeOverride = mutableStateOf<Mode?>(null)
     private val usageTick = mutableIntStateOf(0)
     private val resetTick = mutableIntStateOf(0)
+    private val enterTick = mutableIntStateOf(0)
+
+    /** Ultima zona toccata: l'app si apre "crescendo" da lì. */
+    private var pendingFrom: Rect? = null
+    private var pendingAt = 0L
+
+    private fun markFrom(r: Rect?) {
+        pendingFrom = r
+        pendingAt = android.os.SystemClock.uptimeMillis()
+    }
 
     private val askCalendar = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
 
@@ -189,6 +206,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        enterTick.intValue = enterTick.intValue + 1
         refresh()
     }
 
@@ -224,13 +242,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launch(a: AppEntry) {
-        safeStart(
-            Intent(Intent.ACTION_MAIN)
-                .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setClassName(a.pkg, a.activity)
-                .addFlags(Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED),
-            "Impossibile aprire ${a.label}",
-        )
+        val i = Intent(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LAUNCHER)
+            .setClassName(a.pkg, a.activity)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        val from = if (android.os.SystemClock.uptimeMillis() - pendingAt < 600) pendingFrom else null
+        pendingFrom = null
+        val opts = from?.let {
+            ActivityOptions.makeScaleUpAnimation(
+                window.decorView, it.left.toInt(), it.top.toInt(),
+                it.width.toInt().coerceAtLeast(1), it.height.toInt().coerceAtLeast(1),
+            ).toBundle()
+        }
+        try {
+            startActivity(i, opts)
+        } catch (e: Exception) {
+            toast("Impossibile aprire ${a.label}")
+        }
         AppStore.markSeen(this, a.pkg)
         Usage.record(this, a.pkg)
         newPkgs.value = newPkgs.value - a.pkg
@@ -406,9 +434,21 @@ class MainActivity : ComponentActivity() {
                     .background(Brush.radialGradient(listOf(Accent.copy(alpha = 0.22f), Color.Transparent)))
             )
 
+            val enter = remember { Animatable(1f) }
+            LaunchedEffect(enterTick.intValue) {
+                enter.snapTo(0f)
+                enter.animateTo(1f, tween(460, easing = FastOutSlowInEasing))
+            }
             Column(
                 Modifier
                     .fillMaxSize()
+                    .graphicsLayer {
+                        val v = enter.value
+                        alpha = 0.2f + 0.8f * v
+                        scaleX = 0.94f + 0.06f * v
+                        scaleY = 0.94f + 0.06f * v
+                        translationY = (1f - v) * 60f
+                    }
                     .systemBarsPadding()
                     .padding(start = 20.dp, end = 52.dp, top = 12.dp, bottom = 16.dp)
                     .pointerInput(Unit) {
@@ -532,6 +572,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun SuggestionCard(s: Suggestion) {
         var menu by remember { mutableStateOf(false) }
+        val bounds = remember { mutableStateOf<Rect?>(null) }
         val shape = RoundedCornerShape(18.dp)
         Box {
             Row(
@@ -539,10 +580,11 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(62.dp)
+                    .onGloballyPositioned { bounds.value = it.boundsInWindow() }
                     .clip(shape)
                     .background(Glass)
                     .border(1.dp, GlassLine, shape)
-                    .combinedClickable(onClick = { launch(s.app) }, onLongClick = { menu = true })
+                    .combinedClickable(onClick = { markFrom(bounds.value); launch(s.app) }, onLongClick = { menu = true })
                     .padding(horizontal = 12.dp),
             ) {
                 Image(s.app.icon, contentDescription = null, modifier = Modifier.size(38.dp))
@@ -560,13 +602,15 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun PinnedDot(a: AppEntry) {
         var menu by remember { mutableStateOf(false) }
+        val bounds = remember { mutableStateOf<Rect?>(null) }
         Box {
             Image(
                 a.icon, contentDescription = a.label,
                 modifier = Modifier
                     .size(44.dp)
+                    .onGloballyPositioned { bounds.value = it.boundsInWindow() }
                     .clip(RoundedCornerShape(12.dp))
-                    .combinedClickable(onClick = { launch(a) }, onLongClick = { menu = true }),
+                    .combinedClickable(onClick = { markFrom(bounds.value); launch(a) }, onLongClick = { menu = true }),
             )
             AppMenu(a, menu) { menu = false }
         }
@@ -950,13 +994,15 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun HitRow(h: Hit) {
         var menu by remember { mutableStateOf(false) }
+        val bounds = remember { mutableStateOf<Rect?>(null) }
         Box {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
+                    .onGloballyPositioned { bounds.value = it.boundsInWindow() }
                     .clip(RoundedCornerShape(12.dp))
-                    .combinedClickable(onClick = { h.run() }, onLongClick = { if (h.app != null) menu = true })
+                    .combinedClickable(onClick = { markFrom(bounds.value); h.run() }, onLongClick = { if (h.app != null) menu = true })
                     .padding(horizontal = 8.dp, vertical = 8.dp),
             ) {
                 if (h.icon != null) {
