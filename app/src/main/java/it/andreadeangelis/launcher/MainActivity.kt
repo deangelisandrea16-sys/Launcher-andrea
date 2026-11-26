@@ -2,6 +2,8 @@
 
 package it.andreadeangelis.launcher
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.AlarmManager
 import android.content.Intent
 import android.media.AudioManager
@@ -16,7 +18,14 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -28,16 +37,22 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
@@ -51,8 +66,10 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -62,21 +79,30 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -85,14 +111,15 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 
 private val Ink = Color(0xFFEDEAE4)
 private val Muted = Color(0xFFB5B0A7)
 private val Dim = Color(0xFF8C8880)
 private val Accent = Color(0xFFE8A33D)
-private val Panel = Color(0xB31A1A1C)
-private val Line = Color(0xFF2A2A2D)
-private val Night = Color(0xFF0B0B0C)
+private val Glass = Color(0x0FFFFFFF)
+private val GlassLine = Color(0x1AFFFFFF)
+private val Night = Color(0xFF050506)
 
 data class Cmd(val label: String, val run: () -> Unit)
 
@@ -105,13 +132,28 @@ data class Hit(
     val run: () -> Unit,
 )
 
+data class Suggestion(val app: AppEntry, val why: String)
+
+/** Modalità della home: cambiano le app suggerite. */
+enum class Mode(val label: String, val title: String) {
+    Mattina("Mattina", "MATTINA"), Giorno("Giorno", "GIORNO"), Set("Set", "SUL SET"), Sera("Sera", "SERA")
+}
+
 class MainActivity : ComponentActivity() {
 
     private val apps = mutableStateOf<List<AppEntry>>(emptyList())
     private val newPkgs = mutableStateOf<Set<String>>(emptySet())
     private val pinned = mutableStateOf<List<String>>(emptyList())
     private val nextAlarm = mutableStateOf<String?>(null)
+    private val nextEvent = mutableStateOf<String?>(null)
+    private val calendarOk = mutableStateOf(false)
+    private val mediaOk = mutableStateOf(false)
+    private val playing = mutableStateOf<NowPlaying?>(null)
+    private val modeOverride = mutableStateOf<Mode?>(null)
+    private val usageTick = mutableIntStateOf(0)
     private val resetTick = mutableIntStateOf(0)
+
+    private val askCalendar = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
 
     private val commands: List<Cmd> by lazy {
         listOf(
@@ -120,6 +162,7 @@ class MainActivity : ComponentActivity() {
             Cmd("Spegni PC") { toast("Comando da collegare al programma del PC") },
             Cmd("Wi-Fi") { openSettings(Settings.ACTION_WIFI_SETTINGS) },
             Cmd("Bluetooth") { openSettings(Settings.ACTION_BLUETOOTH_SETTINGS) },
+            Cmd("Notifiche") { expandNotifications() },
             Cmd("Impostazioni") { openSettings(Settings.ACTION_SETTINGS) },
         )
     }
@@ -130,7 +173,18 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
-        setContent { Root() }
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    val np = withContext(Dispatchers.Default) { Media.current(this@MainActivity) }
+                    playing.value = np
+                    delay(1500)
+                }
+            }
+        }
+        setContent {
+            CompositionLocalProvider(LocalTextStyle provides TextStyle(fontFamily = Grotesk, color = Ink)) { Root() }
+        }
     }
 
     override fun onResume() {
@@ -150,6 +204,10 @@ class MainActivity : ComponentActivity() {
             newPkgs.value = AppStore.newPackages(this@MainActivity, list)
             pinned.value = AppStore.pinned(this@MainActivity, list)
             nextAlarm.value = alarmText()
+            calendarOk.value = CalendarRepo.granted(this@MainActivity)
+            mediaOk.value = Media.hasAccess(this@MainActivity)
+            val ev = withContext(Dispatchers.IO) { CalendarRepo.next(this@MainActivity) }
+            nextEvent.value = ev?.let { "${SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(it.begin))} · ${it.title}" }
         }
     }
 
@@ -174,7 +232,9 @@ class MainActivity : ComponentActivity() {
             "Impossibile aprire ${a.label}",
         )
         AppStore.markSeen(this, a.pkg)
+        Usage.record(this, a.pkg)
         newPkgs.value = newPkgs.value - a.pkg
+        usageTick.intValue = usageTick.intValue + 1
     }
 
     private fun launchPkg(pkg: String, name: String) {
@@ -194,6 +254,16 @@ class MainActivity : ComponentActivity() {
             )
         } catch (e: Exception) {
             openSettings(Settings.ACTION_WIRELESS_SETTINGS)
+        }
+    }
+
+    @SuppressLint("WrongConstant")
+    private fun expandNotifications() {
+        try {
+            val sb = getSystemService("statusbar")
+            Class.forName("android.app.StatusBarManager").getMethod("expandNotificationsPanel").invoke(sb)
+        } catch (e: Exception) {
+            // Alcune versioni non lo permettono: nessun problema.
         }
     }
 
@@ -231,6 +301,57 @@ class MainActivity : ComponentActivity() {
         return "Sveglia " + SimpleDateFormat(fmt, Locale.ITALY).format(Date(t))
     }
 
+    private fun autoMode(): Mode {
+        val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        return when (h) {
+            in 5..11 -> Mode.Mattina
+            in 12..18 -> Mode.Giorno
+            else -> Mode.Sera
+        }
+    }
+
+    private fun find(spec: String): AppEntry? {
+        val list = apps.value
+        return if (spec.startsWith("pkg:")) list.firstOrNull { it.pkg == spec.removePrefix("pkg:") }
+        else list.firstOrNull { it.label.equals(spec.removePrefix("label:"), ignoreCase = true) }
+    }
+
+    private fun defaults(m: Mode): List<Pair<String, String>> = when (m) {
+        Mode.Mattina -> listOf(
+            "pkg:com.google.android.calendar" to "La tua giornata",
+            "pkg:com.anthropic.claude" to "Il tuo assistente",
+            "pkg:notion.id" to "Note e progetti",
+        )
+        Mode.Giorno -> listOf(
+            "label:AndreaOS" to "Lavori e clienti",
+            "pkg:com.google.android.apps.docs" to "I tuoi file",
+            "pkg:com.google.android.gm" to "Posta",
+        )
+        Mode.Set -> listOf(
+            "pkg:com.android.camera" to "Riprese veloci",
+            "pkg:dji.go.v5" to "Drone",
+            "label:Race Tracker" to "Gara in corso",
+        )
+        Mode.Sera -> listOf(
+            "pkg:com.apple.android.music" to "Riprendi l'ascolto",
+            "pkg:com.instagram.android" to "Social",
+            "pkg:com.shazam.android" to "Riconosci un brano",
+        )
+    }
+
+    private fun suggestions(m: Mode): List<Suggestion> {
+        val out = mutableListOf<Suggestion>()
+        if (m != Mode.Set) {
+            Usage.top(this, 3).forEach { pkg ->
+                apps.value.firstOrNull { it.pkg == pkg }?.let { out += Suggestion(it, "Usata spesso a quest'ora") }
+            }
+        }
+        defaults(m).forEach { (spec, why) ->
+            if (out.size < 3) find(spec)?.let { a -> if (out.none { it.app.pkg == a.pkg }) out += Suggestion(a, why) }
+        }
+        return out.take(3)
+    }
+
     private fun search(query: String): List<Hit> {
         val q = normalize(query)
         if (q.isEmpty()) return emptyList()
@@ -244,83 +365,114 @@ class MainActivity : ComponentActivity() {
         return appHits + cmdHits
     }
 
+    private fun letterOf(a: AppEntry): String {
+        val c = a.search.firstOrNull() ?: return "#"
+        return if (c in 'a'..'z') c.uppercaseChar().toString() else "#"
+    }
+
     // ---------- Interfaccia ----------
 
     @Composable
     private fun Root() {
-        var query by remember { mutableStateOf("") }
+        var searchOpen by remember { mutableStateOf(false) }
         var drawerOpen by remember { mutableStateOf(false) }
+        var railLetter by remember { mutableStateOf<String?>(null) }
         val tick = resetTick.intValue
 
         LaunchedEffect(tick) {
-            query = ""
+            searchOpen = false
             drawerOpen = false
+            railLetter = null
+            modeOverride.value = null
         }
-        BackHandler(enabled = drawerOpen || query.isNotEmpty()) {
-            if (drawerOpen) drawerOpen = false else query = ""
+        BackHandler(enabled = searchOpen || drawerOpen || railLetter != null) {
+            when {
+                railLetter != null -> railLetter = null
+                searchOpen -> searchOpen = false
+                else -> drawerOpen = false
+            }
         }
-
-        val results = remember(query, apps.value, newPkgs.value) { search(query) }
 
         Box(
             Modifier
                 .fillMaxSize()
-                .background(Brush.verticalGradient(listOf(Color(0x590B0B0C), Color(0xE60B0B0C))))
+                .background(Brush.verticalGradient(listOf(Color(0x99050506), Color(0xF2050506))))
         ) {
+            // Luce calda d'ambiente
+            Box(
+                Modifier
+                    .offset(x = (-140).dp, y = (-160).dp)
+                    .size(460.dp)
+                    .background(Brush.radialGradient(listOf(Accent.copy(alpha = 0.22f), Color.Transparent)))
+            )
+
             Column(
                 Modifier
                     .fillMaxSize()
                     .systemBarsPadding()
-                    .imePadding()
-                    .padding(horizontal = 20.dp)
+                    .padding(start = 20.dp, end = 52.dp, top = 12.dp, bottom = 16.dp)
                     .pointerInput(Unit) {
                         var total = 0f
                         detectVerticalDragGestures(
                             onDragStart = { total = 0f },
-                            onDragEnd = { if (total < -120f) drawerOpen = true },
+                            onDragEnd = {
+                                if (total < -120f) drawerOpen = true
+                                if (total > 120f) expandNotifications()
+                            },
                         ) { _, dy -> total += dy }
                     }
             ) {
-                Spacer(Modifier.height(24.dp))
-                ClockHeader()
-                Spacer(Modifier.height(18.dp))
-                SearchField(query, "Cerca app e comandi", { query = it }) { results.firstOrNull()?.run?.invoke() }
-                Spacer(Modifier.height(18.dp))
-                if (query.isBlank()) {
-                    HomeContent()
-                    Spacer(Modifier.weight(1f))
-                    Text(
-                        "Scorri verso l'alto per tutte le app",
-                        color = Dim,
-                        fontSize = 12.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { drawerOpen = true }
-                            .padding(vertical = 14.dp),
-                    )
-                } else {
-                    LazyColumn(Modifier.weight(1f)) {
-                        items(results) { h -> HitRow(h) }
-                        if (results.isEmpty()) {
-                            item { Text("Nessun risultato", color = Dim, fontSize = 14.sp, modifier = Modifier.padding(12.dp)) }
-                        }
-                    }
-                }
+                ModeChips()
+                Spacer(Modifier.height(26.dp))
+                ClockBlock()
+                Spacer(Modifier.weight(1f))
+                NowBlock()
+                Spacer(Modifier.height(14.dp))
+                MusicRow()
+                Spacer(Modifier.height(14.dp))
+                BottomBar { searchOpen = true }
             }
+
+            Rail(railLetter) { railLetter = it }
+
+            AnimatedVisibility(
+                visible = searchOpen,
+                enter = fadeIn() + slideInVertically { it / 6 },
+                exit = fadeOut(),
+            ) { SearchScreen { searchOpen = false } }
 
             AnimatedVisibility(
                 visible = drawerOpen,
                 enter = slideInVertically { it } + fadeIn(),
                 exit = slideOutVertically { it } + fadeOut(),
-            ) {
-                Drawer { drawerOpen = false }
+            ) { Drawer { drawerOpen = false } }
+        }
+    }
+
+    @Composable
+    private fun ModeChips() {
+        val current = modeOverride.value ?: autoMode()
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Mode.values().forEach { m ->
+                val on = m == current
+                Box(
+                    Modifier
+                        .height(36.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(if (on) Ink else Color.Transparent)
+                        .border(1.dp, if (on) Ink else Color(0x24FFFFFF), RoundedCornerShape(18.dp))
+                        .clickable { modeOverride.value = if (m == autoMode()) null else m }
+                        .padding(horizontal = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(m.label, fontFamily = Mono, fontSize = 12.sp, letterSpacing = 0.5.sp, color = if (on) Night else Muted)
+                }
             }
         }
     }
 
     @Composable
-    private fun ClockHeader() {
+    private fun ClockBlock() {
         var now by remember { mutableStateOf(Date()) }
         LaunchedEffect(Unit) {
             while (true) {
@@ -330,168 +482,178 @@ class MainActivity : ComponentActivity() {
         }
         Text(
             SimpleDateFormat("HH:mm", Locale.ITALY).format(now),
-            color = Ink, fontSize = 64.sp, fontWeight = FontWeight.Medium, letterSpacing = (-2).sp,
+            fontSize = 104.sp, fontWeight = FontWeight.Light, letterSpacing = (-5).sp, lineHeight = 100.sp,
         )
+        Spacer(Modifier.height(10.dp))
         Text(
-            SimpleDateFormat("EEEE d MMMM", Locale.ITALY).format(now).replaceFirstChar { it.uppercase() },
-            color = Muted, fontSize = 15.sp,
+            SimpleDateFormat("EEEE d MMMM", Locale.ITALY).format(now).uppercase(Locale.ITALY),
+            fontFamily = Mono, fontSize = 12.sp, letterSpacing = 2.sp, color = Muted,
         )
-        val alarm = nextAlarm.value
-        if (alarm != null) {
-            Text(
-                alarm,
-                color = Accent, fontSize = 13.sp,
-                modifier = Modifier.clickable { openAlarms() }.padding(top = 6.dp),
-            )
+        Spacer(Modifier.height(14.dp))
+        nextAlarm.value?.let { InfoLine(it) { openAlarms() } }
+        when {
+            !calendarOk.value -> InfoLine("Mostra i tuoi eventi") { askCalendar.launch(Manifest.permission.READ_CALENDAR) }
+            nextEvent.value != null -> InfoLine(nextEvent.value!!) { launchPkg("com.google.android.calendar", "Calendar") }
+            else -> InfoLine("Nessun evento in arrivo") { launchPkg("com.google.android.calendar", "Calendar") }
         }
     }
 
     @Composable
-    private fun SearchField(value: String, hint: String, onChange: (String) -> Unit, onGo: () -> Unit) {
-        val shape = RoundedCornerShape(16.dp)
-        BasicTextField(
-            value = value,
-            onValueChange = onChange,
-            singleLine = true,
-            textStyle = TextStyle(color = Ink, fontSize = 16.sp),
-            cursorBrush = SolidColor(Accent),
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = { onGo() }),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(52.dp)
-                .clip(shape)
-                .background(Panel)
-                .border(1.dp, Line, shape)
-                .padding(horizontal = 16.dp),
-            decorationBox = { inner ->
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
-                    if (value.isEmpty()) Text(hint, color = Dim, fontSize = 16.sp)
-                    inner()
+    private fun InfoLine(text: String, onClick: () -> Unit) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { onClick() }.padding(vertical = 4.dp),
+        ) {
+            Box(Modifier.size(6.dp).clip(CircleShape).background(Accent))
+            Spacer(Modifier.width(10.dp))
+            Text(text, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+
+    @Composable
+    private fun NowBlock() {
+        val m = modeOverride.value ?: autoMode()
+        val tick = usageTick.intValue
+        val list = remember(m, apps.value, tick) { suggestions(m) }
+        Text("ADESSO · ${m.title}", fontFamily = Mono, fontSize = 11.sp, letterSpacing = 2.sp, color = Dim)
+        Spacer(Modifier.height(10.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            list.forEach { s -> SuggestionCard(s) }
+        }
+        if (pinned.value.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            val byPkg = apps.value.associateBy { it.pkg }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                pinned.value.mapNotNull { byPkg[it] }.take(6).forEach { a -> PinnedDot(a) }
+            }
+        }
+    }
+
+    @Composable
+    private fun SuggestionCard(s: Suggestion) {
+        var menu by remember { mutableStateOf(false) }
+        val shape = RoundedCornerShape(18.dp)
+        Box {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(62.dp)
+                    .clip(shape)
+                    .background(Glass)
+                    .border(1.dp, GlassLine, shape)
+                    .combinedClickable(onClick = { launch(s.app) }, onLongClick = { menu = true })
+                    .padding(horizontal = 12.dp),
+            ) {
+                Image(s.app.icon, contentDescription = null, modifier = Modifier.size(38.dp))
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(s.app.label, fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(s.why, fontFamily = Mono, fontSize = 11.sp, color = Dim, maxLines = 1)
                 }
-            },
-        )
-    }
-
-    @Composable
-    private fun HomeContent() {
-        val byPkg = apps.value.associateBy { it.pkg }
-        val fav = pinned.value.mapNotNull { byPkg[it] }
-        fav.chunked(4).forEach { row ->
-            Row(Modifier.fillMaxWidth().padding(bottom = 14.dp)) {
-                row.forEach { a -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { AppTile(a) } }
-                repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
+                Chevron()
             }
-        }
-        Spacer(Modifier.height(6.dp))
-        MusicCard()
-        Spacer(Modifier.height(16.dp))
-        Text("COMANDI RAPIDI", color = Dim, fontSize = 11.sp, letterSpacing = 1.5.sp)
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            commands.take(3).forEach { c ->
-                Box(
-                    Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .border(1.dp, Line, RoundedCornerShape(14.dp))
-                        .clickable { c.run() },
-                    contentAlignment = Alignment.Center,
-                ) { Text(c.label, color = Ink, fontSize = 13.sp, fontWeight = FontWeight.Medium) }
-            }
+            AppMenu(s.app, menu) { menu = false }
         }
     }
 
     @Composable
-    private fun AppTile(a: AppEntry) {
+    private fun PinnedDot(a: AppEntry) {
         var menu by remember { mutableStateOf(false) }
         Box {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
+            Image(
+                a.icon, contentDescription = a.label,
                 modifier = Modifier
-                    .width(76.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .combinedClickable(onClick = { launch(a) }, onLongClick = { menu = true })
-                    .padding(vertical = 6.dp),
-            ) {
-                Image(a.icon, contentDescription = a.label, modifier = Modifier.size(52.dp))
-                Spacer(Modifier.height(6.dp))
-                Text(a.label, color = Ink, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .combinedClickable(onClick = { launch(a) }, onLongClick = { menu = true }),
+            )
             AppMenu(a, menu) { menu = false }
         }
     }
 
     @Composable
-    private fun AppMenu(a: AppEntry, open: Boolean, onDismiss: () -> Unit) {
-        DropdownMenu(expanded = open, onDismissRequest = onDismiss) {
-            val isPinned = a.pkg in pinned.value
-            DropdownMenuItem(
-                text = { Text(if (isPinned) "Rimuovi dalle principali" else "Fissa nelle principali") },
-                onClick = { togglePin(a.pkg); onDismiss() },
+    private fun Chevron() {
+        Canvas(Modifier.size(14.dp)) {
+            val w = size.width
+            val h = size.height
+            drawPath(
+                Path().apply { moveTo(w * 0.35f, h * 0.15f); lineTo(w * 0.75f, h * 0.5f); lineTo(w * 0.35f, h * 0.85f) },
+                Dim, style = Stroke(width = w * 0.14f),
             )
-            DropdownMenuItem(text = { Text("Info app") }, onClick = { appInfo(a.pkg); onDismiss() })
-            DropdownMenuItem(text = { Text("Disinstalla") }, onClick = { uninstall(a.pkg); onDismiss() })
         }
     }
 
     @Composable
-    private fun MusicCard() {
-        val shape = RoundedCornerShape(20.dp)
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .clip(shape)
-                .background(Panel)
-                .border(1.dp, Line, shape)
-                .padding(16.dp)
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "APPLE MUSIC", color = Dim, fontSize = 11.sp, letterSpacing = 1.5.sp,
-                    modifier = Modifier.weight(1f).clickable { launchPkg("com.apple.android.music", "Apple Music") },
-                )
-                Box(
-                    Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(Accent)
-                        .clickable { launchPkg("com.shazam.android", "Shazam") }
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                ) { Text("Shazam", color = Night, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+    private fun MusicRow() {
+        val np = playing.value
+        val isPlaying = np?.playing == true
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Wave(isPlaying)
+            Spacer(Modifier.width(12.dp))
+            val label = when {
+                !mediaOk.value -> "Attiva il controllo musica"
+                np != null && np.title.isNotBlank() -> if (np.artist.isNotBlank()) "${np.title} — ${np.artist}" else np.title
+                else -> "Apple Music · tocca per riprendere"
             }
-            Spacer(Modifier.height(12.dp))
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                MediaButton(Glyph.Prev, false) { mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS) }
-                MediaButton(Glyph.Play, true) { mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) }
-                MediaButton(Glyph.Next, false) { mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT) }
+            Text(
+                label, fontSize = 13.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable {
+                        when {
+                            !mediaOk.value -> openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                            np != null -> launchPkg(np.pkg, "L'app musicale")
+                            else -> launchPkg("com.apple.android.music", "Apple Music")
+                        }
+                    }
+                    .padding(vertical = 8.dp),
+            )
+            MediaButton(Glyph.Prev, false) { mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS) }
+            MediaButton(if (isPlaying) Glyph.Pause else Glyph.Play, true) { mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) }
+            MediaButton(Glyph.Next, false) { mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT) }
+        }
+    }
+
+    @Composable
+    private fun Wave(active: Boolean) {
+        val t = rememberInfiniteTransition(label = "wave")
+        val speeds = listOf(900, 1150, 800, 1300, 1000)
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.Bottom, modifier = Modifier.height(18.dp)) {
+            speeds.forEach { ms ->
+                val v by t.animateFloat(
+                    initialValue = 0.25f, targetValue = 1f,
+                    animationSpec = infiniteRepeatable(tween(ms, easing = LinearEasing), RepeatMode.Reverse),
+                    label = "bar",
+                )
+                val hgt = if (active) v else 0.25f
+                Box(Modifier.width(3.dp).fillMaxHeight(hgt).clip(RoundedCornerShape(2.dp)).background(Accent))
             }
         }
     }
 
-    private enum class Glyph { Prev, Play, Next }
+    private enum class Glyph { Prev, Play, Pause, Next }
 
     @Composable
     private fun MediaButton(g: Glyph, primary: Boolean, onClick: () -> Unit) {
-        val bg = if (primary) Ink else Color.Transparent
         val fg = if (primary) Night else Ink
         Box(
             Modifier
-                .size(if (primary) 52.dp else 44.dp)
+                .size(if (primary) 40.dp else 36.dp)
                 .clip(CircleShape)
-                .background(bg)
+                .background(if (primary) Ink else Color.Transparent)
                 .clickable { onClick() },
             contentAlignment = Alignment.Center,
         ) {
-            Canvas(Modifier.size(18.dp)) {
+            Canvas(Modifier.size(13.dp)) {
                 val w = size.width
                 val h = size.height
                 when (g) {
                     Glyph.Play -> drawPath(Path().apply { moveTo(w * 0.2f, 0f); lineTo(w, h / 2); lineTo(w * 0.2f, h); close() }, fg)
+                    Glyph.Pause -> {
+                        drawRect(fg, Offset(w * 0.15f, 0f), androidx.compose.ui.geometry.Size(w * 0.25f, h))
+                        drawRect(fg, Offset(w * 0.6f, 0f), androidx.compose.ui.geometry.Size(w * 0.25f, h))
+                    }
                     Glyph.Next -> {
                         drawPath(Path().apply { moveTo(0f, 0f); lineTo(w * 0.75f, h / 2); lineTo(0f, h); close() }, fg)
                         drawLine(fg, Offset(w * 0.9f, 0f), Offset(w * 0.9f, h), strokeWidth = w * 0.16f)
@@ -502,6 +664,286 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    @Composable
+    private fun BottomBar(onSearch: () -> Unit) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(56.dp)
+                    .clip(RoundedCornerShape(28.dp))
+                    .background(Color(0x14FFFFFF))
+                    .border(1.dp, GlassLine, RoundedCornerShape(28.dp))
+                    .clickable { onSearch() }
+                    .padding(horizontal = 18.dp),
+            ) {
+                SearchGlyph()
+                Spacer(Modifier.width(10.dp))
+                Text("Cerca o scorri le lettere", fontSize = 15.sp, color = Dim)
+            }
+            Spacer(Modifier.width(12.dp))
+            ShazamOrb()
+        }
+    }
+
+    @Composable
+    private fun SearchGlyph() {
+        Canvas(Modifier.size(18.dp)) {
+            val w = size.width
+            drawCircle(Muted, radius = w * 0.32f, center = Offset(w * 0.42f, w * 0.42f), style = Stroke(width = w * 0.11f))
+            drawLine(Muted, Offset(w * 0.66f, w * 0.66f), Offset(w * 0.95f, w * 0.95f), strokeWidth = w * 0.11f)
+        }
+    }
+
+    @Composable
+    private fun ShazamOrb() {
+        val t = rememberInfiniteTransition(label = "orb")
+        val p by t.animateFloat(0f, 1f, infiniteRepeatable(tween(2400, easing = LinearEasing)), label = "pulse")
+        val extra = with(LocalDensity.current) { 18.dp.toPx() }
+        Box(
+            Modifier
+                .size(56.dp)
+                .drawBehind {
+                    drawCircle(Accent.copy(alpha = 0.45f * (1f - p)), radius = size.minDimension / 2 + extra * p)
+                }
+                .clip(CircleShape)
+                .background(Accent)
+                .clickable { launchPkg("com.shazam.android", "Shazam") },
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(Modifier.size(22.dp)) {
+                val w = size.width
+                val xs = listOf(0.1f, 0.3f, 0.5f, 0.7f, 0.9f)
+                val hs = listOf(0.1f, 0.35f, 0.6f, 0.35f, 0.1f)
+                xs.forEachIndexed { i, x ->
+                    val half = w * hs[i]
+                    drawLine(Night, Offset(w * x, w / 2 - half), Offset(w * x, w / 2 + half), strokeWidth = w * 0.1f)
+                }
+            }
+        }
+    }
+
+    /** La fila di lettere: scorri col pollice, scegli la lettera, poi spostati a sinistra sull'app e lascia. */
+    @Composable
+    private fun Rail(letter: String?, onLetter: (String?) -> Unit) {
+        val haptic = LocalHapticFeedback.current
+        val density = LocalDensity.current
+        val all = apps.value
+        val letters = remember(all) { all.map { letterOf(it) }.distinct().sorted() }
+        val groups = remember(all) { all.groupBy { letterOf(it) } }
+        var hover by remember { mutableIntStateOf(-1) }
+        val rowPx = with(density) { 52.dp.toPx() }
+        val headerPx = with(density) { 56.dp.toPx() }
+        val leftLimit = with(density) { (-28).dp.toPx() }
+
+        BoxWithConstraints(
+            Modifier
+                .fillMaxSize()
+                .systemBarsPadding()
+                .padding(top = 150.dp, bottom = 150.dp)
+        ) {
+            val railH = constraints.maxHeight.toFloat()
+            val n = letters.size.coerceAtLeast(1)
+            val list = letter?.let { groups[it] }.orEmpty().take(8)
+            val idx = letter?.let { letters.indexOf(it) } ?: 0
+            val panelH = headerPx + rowPx * list.size
+            val centerY = (idx + 0.5f) * railH / n
+            val panelTop = (centerY - headerPx / 2).coerceIn(0f, (railH - panelH).coerceAtLeast(0f))
+
+            if (letter != null) {
+                // Tocca fuori per chiudere
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onLetter(null) }
+                )
+                Column(
+                    Modifier
+                        .align(Alignment.TopEnd)
+                        .offset { IntOffset(0, panelTop.roundToInt()) }
+                        .padding(end = 50.dp)
+                        .width(230.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color(0xF0161619))
+                        .border(1.dp, Color(0x1FFFFFFF), RoundedCornerShape(20.dp))
+                        .padding(horizontal = 8.dp)
+                ) {
+                    Row(Modifier.height(56.dp).padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(letter, fontSize = 30.sp, fontWeight = FontWeight.Light, color = Accent, modifier = Modifier.weight(1f))
+                        Text("${groups[letter]?.size ?: 0}", fontFamily = Mono, fontSize = 11.sp, color = Dim)
+                    }
+                    list.forEachIndexed { i, a ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (i == hover) Color(0x26E8A33D) else Color.Transparent)
+                                .clickable { onLetter(null); launch(a) }
+                                .padding(horizontal = 8.dp),
+                        ) {
+                            Image(a.icon, contentDescription = null, modifier = Modifier.size(32.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Text(a.label, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+            }
+
+            Column(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .width(40.dp)
+                    .fillMaxHeight()
+                    .pointerInput(letters, groups) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown()
+                            var current: String? = null
+                            var target = -1
+                            fun track(pos: Offset) {
+                                if (pos.x >= leftLimit) {
+                                    val i = ((pos.y / size.height) * letters.size).toInt().coerceIn(0, letters.size - 1)
+                                    val l = letters.getOrNull(i)
+                                    if (l != null && l != current) {
+                                        current = l
+                                        onLetter(l)
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    }
+                                    target = -1
+                                } else {
+                                    val cnt = (current?.let { groups[it]?.size } ?: 0).coerceAtMost(8)
+                                    val ci = current?.let { letters.indexOf(it) } ?: 0
+                                    val cy = (ci + 0.5f) * size.height / letters.size
+                                    val ph = headerPx + rowPx * cnt
+                                    val top = (cy - headerPx / 2).coerceIn(0f, (size.height - ph).coerceAtLeast(0f))
+                                    val r = ((pos.y - top - headerPx) / rowPx).toInt()
+                                    val nt = if (pos.y >= top + headerPx && r in 0 until cnt) r else -1
+                                    if (nt != target && nt >= 0) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    target = nt
+                                }
+                                hover = target
+                            }
+                            track(down.position)
+                            while (true) {
+                                val ev = awaitPointerEvent()
+                                val ch = ev.changes.firstOrNull() ?: break
+                                if (!ch.pressed) break
+                                track(ch.position)
+                                ch.consume()
+                            }
+                            val l = current
+                            if (target >= 0 && l != null) {
+                                groups[l]?.getOrNull(target)?.let { a -> onLetter(null); launch(a) }
+                            }
+                            hover = -1
+                        }
+                    },
+                verticalArrangement = Arrangement.SpaceBetween,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                letters.forEach { l ->
+                    val on = l == letter
+                    Text(
+                        l,
+                        fontFamily = Mono,
+                        fontSize = if (on) 17.sp else 11.sp,
+                        fontWeight = if (on) FontWeight.Medium else FontWeight.Normal,
+                        color = if (on) Accent else Dim,
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun SearchField(value: String, hint: String, focus: FocusRequester?, onChange: (String) -> Unit, onGo: () -> Unit) {
+        val shape = RoundedCornerShape(28.dp)
+        var mod = Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .clip(shape)
+            .background(Color(0x14FFFFFF))
+            .border(1.dp, GlassLine, shape)
+            .padding(horizontal = 18.dp)
+        if (focus != null) mod = mod.focusRequester(focus)
+        BasicTextField(
+            value = value,
+            onValueChange = onChange,
+            singleLine = true,
+            textStyle = TextStyle(color = Ink, fontSize = 16.sp, fontFamily = Grotesk),
+            cursorBrush = SolidColor(Accent),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+            keyboardActions = KeyboardActions(onGo = { onGo() }),
+            modifier = mod,
+            decorationBox = { inner ->
+                Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+                    SearchGlyph()
+                    Spacer(Modifier.width(10.dp))
+                    Box(Modifier.weight(1f)) {
+                        if (value.isEmpty()) Text(hint, color = Dim, fontSize = 16.sp)
+                        inner()
+                    }
+                }
+            },
+        )
+    }
+
+    @Composable
+    private fun SearchScreen(onClose: () -> Unit) {
+        var query by remember { mutableStateOf("") }
+        val focus = remember { FocusRequester() }
+        val results = remember(query, apps.value, newPkgs.value) { search(query) }
+        LaunchedEffect(Unit) {
+            delay(80)
+            try { focus.requestFocus() } catch (e: Exception) { }
+        }
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(Color(0xF2050506))
+                .systemBarsPadding()
+                .imePadding()
+                .padding(horizontal = 20.dp, vertical = 16.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f)) {
+                    SearchField(query, "Cerca app e comandi", focus, { query = it }) { results.firstOrNull()?.let { h -> onClose(); h.run() } }
+                }
+                Text(
+                    "Chiudi", color = Accent, fontSize = 14.sp,
+                    modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable { onClose() }.padding(12.dp),
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            LazyColumn(Modifier.weight(1f)) {
+                if (query.isBlank()) {
+                    item { SectionLabel("COMANDI") }
+                    items(commands) { c -> HitRow(Hit(c.label, null, "Comando", false, null) { onClose(); c.run() }) }
+                } else {
+                    items(results) { h -> HitRow(h.copy(run = { onClose(); h.run() })) }
+                    if (results.isEmpty()) {
+                        item { Text("Nessun risultato", color = Dim, fontSize = 14.sp, modifier = Modifier.padding(12.dp)) }
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun AppMenu(a: AppEntry, open: Boolean, onDismiss: () -> Unit) {
+        DropdownMenu(expanded = open, onDismissRequest = onDismiss) {
+            val isPinned = a.pkg in pinned.value
+            DropdownMenuItem(
+                text = { Text(if (isPinned) "Rimuovi dalle fissate" else "Fissa nella home") },
+                onClick = { togglePin(a.pkg); onDismiss() },
+            )
+            DropdownMenuItem(text = { Text("Info app") }, onClick = { appInfo(a.pkg); onDismiss() })
+            DropdownMenuItem(text = { Text("Disinstalla") }, onClick = { uninstall(a.pkg); onDismiss() })
         }
     }
 
@@ -521,20 +963,20 @@ class MainActivity : ComponentActivity() {
                     Image(h.icon, contentDescription = null, modifier = Modifier.size(40.dp))
                 } else {
                     Box(
-                        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(Line),
+                        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFF1C1C1F)),
                         contentAlignment = Alignment.Center,
                     ) { Text(h.label.take(1), color = Accent, fontWeight = FontWeight.Bold) }
                 }
                 Spacer(Modifier.width(14.dp))
-                Text(h.label, color = Ink, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                Text(h.label, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                 if (h.isNew) {
                     Text(
-                        "Nuova", color = Night, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                        "Nuova", color = Night, fontSize = 11.sp, fontWeight = FontWeight.Medium,
                         modifier = Modifier.clip(RoundedCornerShape(50)).background(Accent).padding(horizontal = 8.dp, vertical = 2.dp),
                     )
                     Spacer(Modifier.width(8.dp))
                 }
-                Text(h.kind, color = Dim, fontSize = 12.sp)
+                Text(h.kind, fontFamily = Mono, color = Dim, fontSize = 11.sp)
             }
             if (h.app != null) AppMenu(h.app, menu) { menu = false }
         }
@@ -552,7 +994,7 @@ class MainActivity : ComponentActivity() {
         Column(
             Modifier
                 .fillMaxSize()
-                .background(Color(0xF20B0B0C))
+                .background(Color(0xF5050506))
                 .systemBarsPadding()
                 .imePadding()
                 .padding(horizontal = 20.dp)
@@ -570,13 +1012,13 @@ class MainActivity : ComponentActivity() {
                     }
                     .padding(vertical = 16.dp),
             ) {
-                Text("Tutte le app", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+                Text("Tutte le app", fontSize = 24.sp, fontWeight = FontWeight.Light, modifier = Modifier.weight(1f))
                 Text(
                     "Chiudi", color = Accent, fontSize = 14.sp,
                     modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable { onClose() }.padding(10.dp),
                 )
             }
-            SearchField(q, "Cerca tra ${all.size} app", { q = it }) { shown.firstOrNull()?.let { launch(it) } }
+            SearchField(q, "Cerca tra ${all.size} app", null, { q = it }) { shown.firstOrNull()?.let { launch(it) } }
             Spacer(Modifier.height(12.dp))
             LazyColumn(Modifier.weight(1f)) {
                 if (fresh.isNotEmpty()) {
@@ -591,6 +1033,9 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun SectionLabel(t: String) {
-        Text(t, color = Dim, fontSize = 11.sp, letterSpacing = 1.5.sp, modifier = Modifier.padding(start = 8.dp, top = 12.dp, bottom = 4.dp))
+        Text(
+            t, fontFamily = Mono, color = Dim, fontSize = 11.sp, letterSpacing = 1.5.sp,
+            modifier = Modifier.padding(start = 8.dp, top = 12.dp, bottom = 4.dp),
+        )
     }
 }
