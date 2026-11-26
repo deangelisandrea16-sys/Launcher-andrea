@@ -78,6 +78,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -156,6 +157,10 @@ class MainActivity : ComponentActivity() {
     private val calendarOk = mutableStateOf(false)
     private val mediaOk = mutableStateOf(false)
     private val playing = mutableStateOf<NowPlaying?>(null)
+    private val musicActive = mutableStateOf(false)
+    /** Stato "ottimista" subito dopo un tocco, finché il sistema non conferma. */
+    private val playOverride = mutableStateOf<Boolean?>(null)
+    private var playOverrideAt = 0L
     private val task = mutableStateOf(Task.Auto)
     private val nextEventTitle = mutableStateOf("")
     private val nextEventSoon = mutableStateOf(false)
@@ -197,7 +202,9 @@ class MainActivity : ComponentActivity() {
                 while (true) {
                     val np = withContext(Dispatchers.Default) { Media.current(this@MainActivity) }
                     playing.value = np
-                    delay(1500)
+                    musicActive.value = getSystemService(AudioManager::class.java)?.isMusicActive == true
+                    if (android.os.SystemClock.uptimeMillis() - playOverrideAt > 2500) playOverride.value = null
+                    delay(700)
                 }
             }
         }
@@ -620,7 +627,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun MusicRow() {
         val np = playing.value
-        val isPlaying = np?.playing == true
+        val isPlaying = playOverride.value ?: (np?.playing == true || musicActive.value)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Wave(isPlaying)
             Spacer(Modifier.width(12.dp))
@@ -643,7 +650,11 @@ class MainActivity : ComponentActivity() {
                     .padding(vertical = 8.dp),
             )
             MediaButton(Glyph.Prev, false) { mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS) }
-            MediaButton(if (isPlaying) Glyph.Pause else Glyph.Play, true) { mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) }
+            MediaButton(if (isPlaying) Glyph.Pause else Glyph.Play, true) {
+                playOverride.value = !isPlaying
+                playOverrideAt = android.os.SystemClock.uptimeMillis()
+                mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+            }
             MediaButton(Glyph.Next, false) { mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT) }
         }
     }
@@ -769,10 +780,20 @@ class MainActivity : ComponentActivity() {
         val letters = remember(all) { all.map { letterOf(it) }.distinct().sorted() }
         val groups = remember(all) { all.groupBy { letterOf(it) } }
         var hover by remember { mutableIntStateOf(-1) }
+        val latestLetter by rememberUpdatedState(letter)
         val rowPx = with(density) { 52.dp.toPx() }
         val headerPx = with(density) { 56.dp.toPx() }
         val leftLimit = with(density) { (-28).dp.toPx() }
 
+        if (letter != null) {
+            // Tocca ovunque fuori dal pannello per chiudere
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color(0x66000000))
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onLetter(null) }
+            )
+        }
         BoxWithConstraints(
             Modifier
                 .fillMaxSize()
@@ -788,12 +809,6 @@ class MainActivity : ComponentActivity() {
             val panelTop = (centerY - headerPx / 2).coerceIn(0f, (railH - panelH).coerceAtLeast(0f))
 
             if (letter != null) {
-                // Tocca fuori per chiudere
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onLetter(null) }
-                )
                 Column(
                     Modifier
                         .align(Alignment.TopEnd)
@@ -808,6 +823,20 @@ class MainActivity : ComponentActivity() {
                     Row(Modifier.height(56.dp).padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(letter, fontSize = 30.sp, fontWeight = FontWeight.Light, color = Accent, modifier = Modifier.weight(1f))
                         Text("${groups[letter]?.size ?: 0}", fontFamily = Mono, fontSize = 11.sp, color = Dim)
+                        Spacer(Modifier.width(6.dp))
+                        Box(
+                            Modifier
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .clickable { onLetter(null) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Canvas(Modifier.size(14.dp)) {
+                                val w = size.width
+                                drawLine(Muted, Offset(0f, 0f), Offset(w, w), strokeWidth = w * 0.14f)
+                                drawLine(Muted, Offset(w, 0f), Offset(0f, w), strokeWidth = w * 0.14f)
+                            }
+                        }
                     }
                     list.forEachIndexed { i, a ->
                         Row(
@@ -861,11 +890,14 @@ class MainActivity : ComponentActivity() {
                                 }
                                 hover = target
                             }
+                            val before = latestLetter
+                            var moved = false
                             track(down.position)
                             while (true) {
                                 val ev = awaitPointerEvent()
                                 val ch = ev.changes.firstOrNull() ?: break
                                 if (!ch.pressed) break
+                                if ((ch.position - down.position).getDistance() > 12f) moved = true
                                 track(ch.position)
                                 ch.consume()
                             }
@@ -873,6 +905,7 @@ class MainActivity : ComponentActivity() {
                             if (target >= 0 && l != null) {
                                 groups[l]?.getOrNull(target)?.let { a -> onLetter(null); launch(a) }
                             }
+                            if (!moved && target < 0 && before != null && before == current) onLetter(null)
                             hover = -1
                         }
                     },
