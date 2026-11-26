@@ -114,6 +114,14 @@ object AppStore {
         return resolved
     }
 
+    /** Lista personalizzata di un'Attività (null = usa quella automatica). */
+    fun taskList(c: Context, task: String): List<String>? =
+        prefs(c).getString("task_$task", null)?.split("|")?.filter { it.isNotBlank() }
+
+    fun setTaskList(c: Context, task: String, list: List<String>) {
+        prefs(c).edit().putString("task_$task", list.joinToString("|")).apply()
+    }
+
     fun setPinned(c: Context, list: List<String>) {
         prefs(c).edit().putString("essentials", list.joinToString("|")).apply()
     }

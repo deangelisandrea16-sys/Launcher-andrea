@@ -7,7 +7,11 @@ import android.annotation.SuppressLint
 import android.app.ActivityOptions
 import android.app.AlarmManager
 import android.content.Intent
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.net.wifi.WifiManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.AlarmClock
@@ -42,6 +46,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -137,6 +142,8 @@ data class Hit(
     val kind: String,
     val isNew: Boolean,
     val app: AppEntry?,
+    val altLabel: String = "",
+    val alt: (() -> Unit)? = null,
     val run: () -> Unit,
 )
 
@@ -167,6 +174,17 @@ class MainActivity : ComponentActivity() {
     private val usageTick = mutableIntStateOf(0)
     private val resetTick = mutableIntStateOf(0)
     private val update = mutableStateOf<UpdateInfo?>(null)
+    private val editMode = mutableStateOf(false)
+    private val pickFor = mutableStateOf<String?>(null)
+    private val taskLists = mutableStateOf<Map<String, List<String>>>(emptyMap())
+    private val contacts = mutableStateOf<List<Contact>>(emptyList())
+    private val contactsOk = mutableStateOf(false)
+    private val weather = mutableStateOf<String?>(null)
+    private val weatherOk = mutableStateOf(false)
+    private var weatherAt = 0L
+    private val headphones = mutableStateOf(false)
+    private val hotspot = mutableStateOf(false)
+    private val nextEventPlace = mutableStateOf("")
     private val dlProgress = mutableStateOf<Float?>(null)
     private val enterTick = mutableIntStateOf(0)
 
@@ -181,12 +199,14 @@ class MainActivity : ComponentActivity() {
 
     private val askCalendar = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
     private val askNotif = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val askContacts = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+    private val askLocation = registerForActivityResult(ActivityResultContracts.RequestPermission()) { weatherAt = 0L; refresh() }
 
     private val commands: List<Cmd> by lazy {
         listOf(
             Cmd("Sveglia") { openAlarms() },
             Cmd("Hotspot") { openHotspot() },
-            Cmd("Spegni PC") { toast("Comando da collegare al programma del PC") },
+            Cmd("Controllo PC (spegni, riavvia)") { openPc() },
             Cmd("Wi-Fi") { openSettings(Settings.ACTION_WIFI_SETTINGS) },
             Cmd("Bluetooth") { openSettings(Settings.ACTION_BLUETOOTH_SETTINGS) },
             Cmd("Notifiche") { expandNotifications() },
@@ -203,7 +223,9 @@ class MainActivity : ComponentActivity() {
         )
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                var n = 0
                 while (true) {
+                    if (n++ % 7 == 0) readContext()
                     val np = withContext(Dispatchers.Default) { Media.current(this@MainActivity) }
                     playing.value = np
                     musicActive.value = getSystemService(AudioManager::class.java)?.isMusicActive == true
@@ -245,11 +267,84 @@ class MainActivity : ComponentActivity() {
             calendarOk.value = CalendarRepo.granted(this@MainActivity)
             mediaOk.value = Media.hasAccess(this@MainActivity)
             checkUpdate(force = false)
+            taskLists.value = Task.values().associate { t -> t.name to (AppStore.taskList(this@MainActivity, t.name) ?: emptyList()) }
+            contactsOk.value = Contacts.granted(this@MainActivity)
+            if (contactsOk.value) contacts.value = withContext(Dispatchers.IO) { Contacts.load(this@MainActivity) }
+            weatherOk.value = Weather.granted(this@MainActivity)
+            if (weatherOk.value && System.currentTimeMillis() - weatherAt > 30 * 60 * 1000L) {
+                val w = withContext(Dispatchers.IO) { Weather.now(this@MainActivity) }
+                if (w != null) { weather.value = w; weatherAt = System.currentTimeMillis() }
+            }
             val ev = withContext(Dispatchers.IO) { CalendarRepo.next(this@MainActivity) }
+            nextEventPlace.value = ev?.location ?: ""
             nextEventTitle.value = ev?.title ?: ""
             nextEventSoon.value = ev != null && ev.begin - System.currentTimeMillis() < 3 * 3600 * 1000L
             nextEvent.value = ev?.let { "${SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(it.begin))} · ${it.title}" }
         }
+    }
+
+    // ---------- Contesto ----------
+
+    private fun readContext() {
+        val am = getSystemService(AudioManager::class.java)
+        val outs = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS).orEmpty()
+        val heads = setOf(
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET, 26, // 26 = BLE headset
+        )
+        headphones.value = outs.any { it.type in heads }
+        hotspot.value = try {
+            val wm = applicationContext.getSystemService(WifiManager::class.java)
+            wm?.javaClass?.getMethod("isWifiApEnabled")?.invoke(wm) as? Boolean ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun openPc() {
+        val a = apps.value.firstOrNull { normalize(it.label).contains("controllo pc") }
+        if (a != null) launch(a) else toast("Aggiungi la webapp Controllo PC alla schermata Home del telefono")
+    }
+
+    private fun openMaps(place: String) = safeStart(
+        Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/maps/dir/?api=1&destination=" + Uri.encode(place))),
+        "Mappe non disponibili",
+    )
+
+    private fun webSearch(q: String) = safeStart(
+        Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))),
+        "Browser non disponibile",
+    )
+
+    private fun copy(text: String) {
+        getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("risultato", text))
+        toast("Copiato: $text")
+    }
+
+    // ---------- Modifica ----------
+
+    private fun move(list: List<String>, pkg: String, dir: Int): List<String> {
+        val i = list.indexOf(pkg)
+        val j = i + dir
+        if (i < 0 || j < 0 || j >= list.size) return list
+        val m = list.toMutableList()
+        m[i] = m[j].also { m[j] = m[i] }
+        return m
+    }
+
+    private fun editList(target: String, change: (List<String>) -> List<String>) {
+        if (target == "ess") {
+            val next = change(pinned.value)
+            pinned.value = next
+            AppStore.setPinned(this, next)
+        } else {
+            val t = Task.valueOf(target)
+            val cur = taskLists.value[target].orEmpty().ifEmpty { activityApps(t).map { it.pkg } }
+            val next = change(cur)
+            taskLists.value = taskLists.value + (target to next)
+            AppStore.setTaskList(this, target, next)
+        }
+        usageTick.intValue = usageTick.intValue + 1
     }
 
     // ---------- Aggiornamenti ----------
@@ -420,6 +515,8 @@ class MainActivity : ComponentActivity() {
             if (listOf("gara", "wsk", "kart", "trofeo", "circuito", "race").any { title.contains(it) }) return Task.Gara to "dal calendario"
             if (listOf("ripres", "set", "shoot", "video", "foto", "sopralluogo").any { title.contains(it) }) return Task.Set to "dal calendario"
         }
+        if (hotspot.value) return Task.Ufficio to "hotspot attivo"
+        if (headphones.value) return Task.Relax to "cuffie collegate"
         val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         return if (h in 8..18) Task.Ufficio to "dall'ora" else Task.Relax to "dall'ora"
     }
@@ -446,6 +543,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun activityApps(t: Task): List<AppEntry> {
+        val custom = taskLists.value[t.name].orEmpty()
+        if (custom.isNotEmpty()) {
+            val byPkg = apps.value.associateBy { it.pkg }
+            return custom.mapNotNull { byPkg[it] }
+        }
         val out = mutableListOf<AppEntry>()
         val ess = pinned.value.toSet()
         if (task.value == Task.Auto) {
@@ -464,12 +566,24 @@ class MainActivity : ComponentActivity() {
         if (q.isEmpty()) return emptyList()
         val cmdHits = commands
             .filter { normalize(it.label).contains(q) }
-            .map { c -> Hit(c.label, null, "Comando", false, null, c.run) }
+            .map { c -> Hit(c.label, null, "Comando", false, null) { c.run() } }
         val appHits = apps.value
             .filter { it.search.contains(q) }
             .sortedBy { if (it.search.startsWith(q)) 0 else 1 }
             .map { a -> Hit(a.label, a.icon, "App", a.pkg in newPkgs.value, a) { launch(a) } }
-        return appHits + cmdHits
+        val calc = Calc.evaluate(query)?.let { v -> listOf(Hit("= $v", null, "Calcolo", false, null) { copy(v) }) }.orEmpty()
+        val contactHits = contacts.value
+            .filter { it.search.contains(q) }
+            .take(6)
+            .map { ct ->
+                Hit(
+                    ct.name, null, "Contatto", false, null,
+                    altLabel = "WhatsApp",
+                    alt = { safeStart(Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/" + Contacts.waNumber(ct.number))), "WhatsApp non disponibile") },
+                ) { safeStart(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(ct.number))), "Telefono non disponibile") }
+            }
+        val web = listOf(Hit("Cerca sul web: $query", null, "Web", false, null) { webSearch(query) })
+        return calc + appHits + contactHits + cmdHits + web
     }
 
     private fun letterOf(a: AppEntry): String {
@@ -491,9 +605,12 @@ class MainActivity : ComponentActivity() {
             drawerOpen = false
             railLetter = null
         }
-        BackHandler(enabled = searchOpen || drawerOpen || railLetter != null) {
+        LaunchedEffect(tick) { editMode.value = false; pickFor.value = null }
+        BackHandler(enabled = searchOpen || drawerOpen || railLetter != null || editMode.value || pickFor.value != null) {
             when {
+                pickFor.value != null -> pickFor.value = null
                 railLetter != null -> railLetter = null
+                editMode.value && !searchOpen && !drawerOpen -> editMode.value = false
                 searchOpen -> searchOpen = false
                 else -> drawerOpen = false
             }
@@ -529,6 +646,7 @@ class MainActivity : ComponentActivity() {
                     }
                     .systemBarsPadding()
                     .padding(start = 20.dp, end = 52.dp, top = 12.dp, bottom = 16.dp)
+                    .pointerInput(Unit) { detectTapGestures(onLongPress = { editMode.value = true }) }
                     .pointerInput(Unit) {
                         var total = 0f
                         detectVerticalDragGestures(
@@ -541,7 +659,7 @@ class MainActivity : ComponentActivity() {
                     }
             ) {
                 UpdateBanner()
-                TaskChips()
+                if (editMode.value) EditBar() else TaskChips()
                 Spacer(Modifier.height(20.dp))
                 ClockBlock()
                 Spacer(Modifier.weight(1f))
@@ -566,7 +684,56 @@ class MainActivity : ComponentActivity() {
                 visible = drawerOpen,
                 enter = slideInVertically { it } + fadeIn(),
                 exit = slideOutVertically { it } + fadeOut(),
-            ) { Drawer { drawerOpen = false } }
+            ) { Drawer(null) { drawerOpen = false } }
+
+            AnimatedVisibility(
+                visible = pickFor.value != null,
+                enter = slideInVertically { it } + fadeIn(),
+                exit = slideOutVertically { it } + fadeOut(),
+            ) {
+                Drawer(pickFor.value) { pickFor.value = null }
+            }
+        }
+    }
+
+    @Composable
+    private fun EditBar() {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().height(34.dp)) {
+            Text("MODIFICA · usa ‹ › per spostare, ✕ per togliere", fontFamily = Mono, fontSize = 10.sp, color = Accent, modifier = Modifier.weight(1f))
+            Box(
+                Modifier.clip(RoundedCornerShape(17.dp)).background(Ink).clickable { editMode.value = false }.padding(horizontal = 14.dp, vertical = 8.dp),
+            ) { Text("Fine", color = Night, fontSize = 13.sp, fontWeight = FontWeight.Medium) }
+        }
+    }
+
+    @Composable
+    private fun EditControls(target: String, pkg: String) {
+        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            listOf("‹" to -1, "›" to 1, "✕" to 0).forEach { (g, d) ->
+                Box(
+                    Modifier
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .background(Color(0x22FFFFFF))
+                        .clickable { editList(target) { l -> if (d == 0) l - pkg else move(l, pkg, d) } },
+                    contentAlignment = Alignment.Center,
+                ) { Text(g, fontSize = 13.sp, color = if (d == 0) Color(0xFFFF8A80) else Ink) }
+            }
+        }
+    }
+
+    @Composable
+    private fun AddTile(target: String, sizeDp: Int) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).clickable { pickFor.value = target }.padding(vertical = 4.dp),
+        ) {
+            Box(
+                Modifier.size(sizeDp.dp).clip(RoundedCornerShape(14.dp)).border(1.dp, Accent, RoundedCornerShape(14.dp)),
+                contentAlignment = Alignment.Center,
+            ) { Text("+", fontSize = 26.sp, color = Accent, fontWeight = FontWeight.Light) }
+            Spacer(Modifier.height(5.dp))
+            Text("Aggiungi", fontSize = 11.sp, color = Accent)
         }
     }
 
@@ -611,10 +778,23 @@ class MainActivity : ComponentActivity() {
             fontFamily = Mono, fontSize = 12.sp, letterSpacing = 2.sp, color = Muted,
         )
         Spacer(Modifier.height(14.dp))
+        when {
+            !weatherOk.value -> InfoLine("Mostra il meteo") { askLocation.launch(Manifest.permission.ACCESS_COARSE_LOCATION) }
+            weather.value != null -> InfoLine(weather.value!!) { webSearch("meteo") }
+        }
         nextAlarm.value?.let { InfoLine(it) { openAlarms() } }
         when {
             !calendarOk.value -> InfoLine("Mostra i tuoi eventi") { askCalendar.launch(Manifest.permission.READ_CALENDAR) }
-            nextEvent.value != null -> InfoLine(nextEvent.value!!) { launchPkg("com.google.android.calendar", "Calendar") }
+            nextEvent.value != null -> Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f, fill = false)) { InfoLine(nextEvent.value!!) { launchPkg("com.google.android.calendar", "Calendar") } }
+                if (nextEventPlace.value.isNotBlank()) {
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        "Indicazioni", color = Accent, fontSize = 13.sp,
+                        modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { openMaps(nextEventPlace.value) }.padding(6.dp),
+                    )
+                }
+            }
             else -> InfoLine("Nessun evento in arrivo") { launchPkg("com.google.android.calendar", "Calendar") }
         }
     }
@@ -635,14 +815,21 @@ class MainActivity : ComponentActivity() {
     private fun Essentials() {
         val byPkg = apps.value.associateBy { it.pkg }
         val list = pinned.value.mapNotNull { byPkg[it] }
-        if (list.isEmpty()) return
+        val edit = editMode.value
+        if (list.isEmpty() && !edit) return
         Text("ESSENZIALI", fontFamily = Mono, fontSize = 11.sp, letterSpacing = 2.sp, color = Dim)
         Spacer(Modifier.height(10.dp))
-        val cols = if (list.size > 8) 5 else 4
+        val count = list.size + if (edit) 1 else 0
+        val cols = if (count > 8) 5 else 4
         val iconDp = if (cols == 5) 46 else 52
-        list.chunked(cols).forEach { row ->
+        val cells: List<AppEntry?> = list + if (edit) listOf(null) else emptyList()
+        cells.chunked(cols).forEach { row ->
             Row(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
-                row.forEach { a -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { AppIcon(a, iconDp, true) } }
+                row.forEach { a ->
+                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        if (a == null) AddTile("ess", iconDp) else AppIcon(a, iconDp, true, if (edit) "ess" else null)
+                    }
+                }
                 repeat(cols - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
@@ -652,7 +839,8 @@ class MainActivity : ComponentActivity() {
     private fun ActivityRow() {
         val tick = usageTick.intValue
         val (t, why) = resolveTask()
-        val list = remember(t, apps.value, pinned.value, tick) { activityApps(t) }
+        val list = remember(t, apps.value, pinned.value, tick, taskLists.value) { activityApps(t) }
+        val edit = editMode.value
         val shape = RoundedCornerShape(20.dp)
         Column(
             Modifier
@@ -667,15 +855,22 @@ class MainActivity : ComponentActivity() {
                 Text(why, fontFamily = Mono, fontSize = 10.sp, color = Dim)
             }
             Spacer(Modifier.height(10.dp))
-            Row(Modifier.fillMaxWidth()) {
-                list.forEach { a -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { AppIcon(a, 44, true) } }
-                repeat((4 - list.size).coerceAtLeast(0)) { Spacer(Modifier.weight(1f)) }
+            val cells: List<AppEntry?> = list + if (edit) listOf(null) else emptyList()
+            cells.chunked(4).forEach { row ->
+                Row(Modifier.fillMaxWidth()) {
+                    row.forEach { a ->
+                        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                            if (a == null) AddTile(t.name, 44) else AppIcon(a, 44, true, if (edit) t.name else null)
+                        }
+                    }
+                    repeat((4 - row.size).coerceAtLeast(0)) { Spacer(Modifier.weight(1f)) }
+                }
             }
         }
     }
 
     @Composable
-    private fun AppIcon(a: AppEntry, sizeDp: Int, label: Boolean) {
+    private fun AppIcon(a: AppEntry, sizeDp: Int, label: Boolean, editTarget: String? = null) {
         var menu by remember { mutableStateOf(false) }
         val bounds = remember { mutableStateOf<Rect?>(null) }
         Box {
@@ -685,11 +880,17 @@ class MainActivity : ComponentActivity() {
                     .fillMaxWidth()
                     .onGloballyPositioned { bounds.value = it.boundsInWindow() }
                     .clip(RoundedCornerShape(14.dp))
-                    .combinedClickable(onClick = { markFrom(bounds.value); launch(a) }, onLongClick = { menu = true })
+                    .combinedClickable(
+                        onClick = { if (editTarget == null) { markFrom(bounds.value); launch(a) } },
+                        onLongClick = { if (editTarget == null) menu = true },
+                    )
                     .padding(vertical = 4.dp),
             ) {
                 Image(a.icon, contentDescription = a.label, modifier = Modifier.size(sizeDp.dp))
-                if (label) {
+                if (editTarget != null) {
+                    Spacer(Modifier.height(4.dp))
+                    EditControls(editTarget, a.pkg)
+                } else if (label) {
                     Spacer(Modifier.height(5.dp))
                     Text(a.label, fontSize = 11.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
@@ -1049,7 +1250,7 @@ class MainActivity : ComponentActivity() {
     private fun SearchScreen(onClose: () -> Unit) {
         var query by remember { mutableStateOf("") }
         val focus = remember { FocusRequester() }
-        val results = remember(query, apps.value, newPkgs.value) { search(query) }
+        val results = remember(query, apps.value, newPkgs.value, contacts.value) { search(query) }
         LaunchedEffect(Unit) {
             delay(80)
             try { focus.requestFocus() } catch (e: Exception) { }
@@ -1064,7 +1265,7 @@ class MainActivity : ComponentActivity() {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) {
-                    SearchField(query, "Cerca app e comandi", focus, { query = it }) { results.firstOrNull()?.let { h -> onClose(); h.run() } }
+                    SearchField(query, "App, contatti, calcoli, web", focus, { query = it }) { results.firstOrNull()?.let { h -> onClose(); h.run() } }
                 }
                 Text(
                     "Chiudi", color = Accent, fontSize = 14.sp,
@@ -1074,6 +1275,9 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(12.dp))
             LazyColumn(Modifier.weight(1f)) {
                 if (query.isBlank()) {
+                    if (!contactsOk.value) {
+                        item { HitRow(Hit("Cerca anche nei contatti", null, "Permesso", false, null) { askContacts.launch(Manifest.permission.READ_CONTACTS) }) }
+                    }
                     item { SectionLabel("COMANDI") }
                     items(commands) { c -> HitRow(Hit(c.label, null, "Comando", false, null) { onClose(); c.run() }) }
                 } else {
@@ -1136,6 +1340,14 @@ class MainActivity : ComponentActivity() {
                     )
                     Spacer(Modifier.width(8.dp))
                 }
+                if (h.alt != null) {
+                    Text(
+                        h.altLabel, color = Accent, fontSize = 13.sp,
+                        modifier = Modifier.clip(RoundedCornerShape(10.dp)).border(1.dp, Accent, RoundedCornerShape(10.dp))
+                            .clickable { h.alt.invoke() }.padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
                 Text(h.kind, fontFamily = Mono, color = Dim, fontSize = 11.sp)
             }
             if (h.app != null) AppMenu(h.app, menu) { menu = false }
@@ -1143,7 +1355,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun Drawer(onClose: () -> Unit) {
+    private fun Drawer(pick: String?, onClose: () -> Unit) {
         var q by remember { mutableStateOf("") }
         val all = apps.value
         val nq = normalize(q)
@@ -1172,21 +1384,24 @@ class MainActivity : ComponentActivity() {
                     }
                     .padding(vertical = 16.dp),
             ) {
-                Text("Tutte le app", fontSize = 24.sp, fontWeight = FontWeight.Light, modifier = Modifier.weight(1f))
+                Text(if (pick == null) "Tutte le app" else "Scegli un'app", fontSize = 24.sp, fontWeight = FontWeight.Light, modifier = Modifier.weight(1f))
                 Text(
                     "Chiudi", color = Accent, fontSize = 14.sp,
                     modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable { onClose() }.padding(10.dp),
                 )
             }
-            SearchField(q, "Cerca tra ${all.size} app", null, { q = it }) { shown.firstOrNull()?.let { launch(it) } }
+            val act: (AppEntry) -> Unit = { a ->
+                if (pick == null) launch(a) else { editList(pick) { l -> if (a.pkg in l) l else l + a.pkg }; onClose() }
+            }
+            SearchField(q, "Cerca tra ${all.size} app", null, { q = it }) { shown.firstOrNull()?.let { act(it) } }
             Spacer(Modifier.height(12.dp))
             LazyColumn(Modifier.weight(1f)) {
                 if (fresh.isNotEmpty()) {
                     item { SectionLabel("NUOVE") }
-                    items(fresh, key = { "n" + it.key }) { a -> HitRow(Hit(a.label, a.icon, "", true, a) { launch(a) }) }
+                    items(fresh, key = { "n" + it.key }) { a -> HitRow(Hit(a.label, a.icon, "", true, a) { act(a) }) }
                     item { SectionLabel("TUTTE") }
                 }
-                items(rest, key = { it.key }) { a -> HitRow(Hit(a.label, a.icon, "", false, a) { launch(a) }) }
+                items(rest, key = { it.key }) { a -> HitRow(Hit(a.label, a.icon, "", false, a) { act(a) }) }
             }
         }
     }
