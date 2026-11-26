@@ -15,6 +15,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      HAS_RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -61,5 +63,18 @@ jobs:
           tag_name: v0.1.${{ github.run_number }}
           name: Launcher v0.1.${{ github.run_number }}
           body: "Scarica launcher-andrea.apk e installalo sul telefono."
+          files: launcher-andrea.apk
+          make_latest: true
+
+      # Copia pubblica del solo APK (il codice resta privato). Serve il Secret RELEASES_TOKEN.
+      - name: Pubblica APK nella repo pubblica
+        if: ${{ env.HAS_RELEASES_TOKEN == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: deangelisandrea16-sys/launcher-andrea-releases
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: v0.1.${{ github.run_number }}
+          name: Launcher v0.1.${{ github.run_number }}
+          body: "Aggiornamento del launcher."
           files: launcher-andrea.apk
           make_latest: true

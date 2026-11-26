@@ -36,6 +36,8 @@ object AppStore {
         "pkg:com.google.android.calendar",
         "pkg:com.apple.android.music",
         "pkg:com.google.android.gm",
+        "pkg:com.whatsapp",
+        "pkg:com.whatsapp.w4b",
         "pkg:com.instagram.android",
     )
 
@@ -89,6 +91,13 @@ object AppStore {
                 list = list.map { if (it == "com.shazam.android") gm else it }.distinct()
                 if (gm !in list && apps.any { it.pkg == gm }) list = list + gm
                 p.edit().putBoolean("ess_v2", true).apply()
+                setPinned(c, list)
+            }
+            // v0.1.9: WhatsApp sempre negli essenziali
+            if (!p.getBoolean("ess_v3", false)) {
+                val wa = listOf("com.whatsapp", "com.whatsapp.w4b").filter { w -> apps.any { it.pkg == w } }
+                wa.forEach { if (it !in list) list = list + it }
+                p.edit().putBoolean("ess_v3", true).apply()
                 setPinned(c, list)
             }
             return list

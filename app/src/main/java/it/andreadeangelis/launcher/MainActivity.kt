@@ -166,6 +166,8 @@ class MainActivity : ComponentActivity() {
     private val nextEventSoon = mutableStateOf(false)
     private val usageTick = mutableIntStateOf(0)
     private val resetTick = mutableIntStateOf(0)
+    private val update = mutableStateOf<UpdateInfo?>(null)
+    private val dlProgress = mutableStateOf<Float?>(null)
     private val enterTick = mutableIntStateOf(0)
 
     /** Ultima zona toccata: l'app si apre "crescendo" da lì. */
@@ -178,6 +180,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private val askCalendar = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+    private val askNotif = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     private val commands: List<Cmd> by lazy {
         listOf(
@@ -188,6 +191,7 @@ class MainActivity : ComponentActivity() {
             Cmd("Bluetooth") { openSettings(Settings.ACTION_BLUETOOTH_SETTINGS) },
             Cmd("Notifiche") { expandNotifications() },
             Cmd("Impostazioni") { openSettings(Settings.ACTION_SETTINGS) },
+            Cmd("Controlla aggiornamenti") { checkUpdate(force = true) },
         )
     }
 
@@ -206,6 +210,13 @@ class MainActivity : ComponentActivity() {
                     if (android.os.SystemClock.uptimeMillis() - playOverrideAt > 2500) playOverride.value = null
                     delay(700)
                 }
+            }
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val p = getSharedPreferences("launcher", MODE_PRIVATE)
+            if (!p.getBoolean("askedNotif", false)) {
+                p.edit().putBoolean("askedNotif", true).apply()
+                askNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
         setContent {
@@ -233,10 +244,70 @@ class MainActivity : ComponentActivity() {
             nextAlarm.value = alarmText()
             calendarOk.value = CalendarRepo.granted(this@MainActivity)
             mediaOk.value = Media.hasAccess(this@MainActivity)
+            checkUpdate(force = false)
             val ev = withContext(Dispatchers.IO) { CalendarRepo.next(this@MainActivity) }
             nextEventTitle.value = ev?.title ?: ""
             nextEventSoon.value = ev != null && ev.begin - System.currentTimeMillis() < 3 * 3600 * 1000L
             nextEvent.value = ev?.let { "${SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(it.begin))} · ${it.title}" }
+        }
+    }
+
+    // ---------- Aggiornamenti ----------
+
+    private fun checkUpdate(force: Boolean) {
+        lifecycleScope.launch {
+            val u = withContext(Dispatchers.IO) { Updater.check(this@MainActivity, force) }
+            update.value = u
+            if (u != null) Updater.notifyOnce(this@MainActivity, u)
+            else if (force) toast("Hai già l'ultima versione")
+        }
+    }
+
+    private fun startUpdate() {
+        val u = update.value ?: return
+        if (dlProgress.value != null) return
+        if (!packageManager.canRequestPackageInstalls()) {
+            toast("Consenti l'installazione, poi torna indietro e tocca di nuovo Installa")
+            safeStart(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")),
+                "Impostazione non disponibile",
+            )
+            return
+        }
+        dlProgress.value = 0f
+        lifecycleScope.launch {
+            val f = withContext(Dispatchers.IO) {
+                Updater.download(this@MainActivity, u) { p -> dlProgress.value = p }
+            }
+            dlProgress.value = null
+            if (f == null) toast("Download non riuscito, riprova") else Updater.install(this@MainActivity, f)
+        }
+    }
+
+    @Composable
+    private fun UpdateBanner() {
+        val u = update.value ?: return
+        val prog = dlProgress.value
+        val shape = RoundedCornerShape(16.dp)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 14.dp)
+                .clip(shape)
+                .background(Color(0x26E8A33D))
+                .border(1.dp, Accent, shape)
+                .clickable { startUpdate() }
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Aggiornamento ${u.tag}", fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    if (prog == null) "Tocca per installare" else "Download ${(prog * 100).toInt()}%",
+                    fontFamily = Mono, fontSize = 11.sp, color = Muted,
+                )
+            }
+            Text(if (prog == null) "Installa" else "…", color = Accent, fontWeight = FontWeight.Medium, fontSize = 14.sp)
         }
     }
 
@@ -469,6 +540,7 @@ class MainActivity : ComponentActivity() {
                         ) { _, dy -> total += dy }
                     }
             ) {
+                UpdateBanner()
                 TaskChips()
                 Spacer(Modifier.height(20.dp))
                 ClockBlock()
@@ -566,10 +638,12 @@ class MainActivity : ComponentActivity() {
         if (list.isEmpty()) return
         Text("ESSENZIALI", fontFamily = Mono, fontSize = 11.sp, letterSpacing = 2.sp, color = Dim)
         Spacer(Modifier.height(10.dp))
-        list.chunked(4).forEach { row ->
+        val cols = if (list.size > 8) 5 else 4
+        val iconDp = if (cols == 5) 46 else 52
+        list.chunked(cols).forEach { row ->
             Row(Modifier.fillMaxWidth().padding(bottom = 10.dp)) {
-                row.forEach { a -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { AppIcon(a, 52, true) } }
-                repeat(4 - row.size) { Spacer(Modifier.weight(1f)) }
+                row.forEach { a -> Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { AppIcon(a, iconDp, true) } }
+                repeat(cols - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
     }
@@ -608,7 +682,7 @@ class MainActivity : ComponentActivity() {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
-                    .width(76.dp)
+                    .fillMaxWidth()
                     .onGloballyPositioned { bounds.value = it.boundsInWindow() }
                     .clip(RoundedCornerShape(14.dp))
                     .combinedClickable(onClick = { markFrom(bounds.value); launch(a) }, onLongClick = { menu = true })
