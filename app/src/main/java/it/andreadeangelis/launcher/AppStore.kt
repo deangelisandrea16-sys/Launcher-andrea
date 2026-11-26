@@ -35,7 +35,7 @@ object AppStore {
         "pkg:com.google.android.apps.docs",
         "pkg:com.google.android.calendar",
         "pkg:com.apple.android.music",
-        "pkg:com.shazam.android",
+        "pkg:com.google.android.gm",
         "pkg:com.instagram.android",
     )
 
@@ -81,7 +81,18 @@ object AppStore {
     fun pinned(c: Context, apps: List<AppEntry>): List<String> {
         val p = prefs(c)
         val saved = p.getString("essentials", null)
-        if (saved != null) return saved.split("|").filter { it.isNotBlank() }
+        if (saved != null) {
+            var list = saved.split("|").filter { it.isNotBlank() }
+            // v0.1.8: Shazam ha già il suo pulsante, al suo posto Gmail
+            if (!p.getBoolean("ess_v2", false)) {
+                val gm = "com.google.android.gm"
+                list = list.map { if (it == "com.shazam.android") gm else it }.distinct()
+                if (gm !in list && apps.any { it.pkg == gm }) list = list + gm
+                p.edit().putBoolean("ess_v2", true).apply()
+                setPinned(c, list)
+            }
+            return list
+        }
         if (apps.isEmpty()) return emptyList()
         val resolved = DEFAULT_PINNED.mapNotNull { m ->
             if (m.startsWith("pkg:")) {

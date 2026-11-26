@@ -360,19 +360,31 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun defaults(t: Task): List<String> = when (t) {
-        Task.Ufficio -> listOf("label:AndreaOS", "pkg:com.google.android.gm", "pkg:com.google.android.apps.docs", "pkg:com.google.android.calendar")
-        Task.Set -> listOf("pkg:com.android.camera", "pkg:dji.go.v5", "pkg:jp.co.sony.ips.portalapp", "pkg:com.miui.gallery")
-        Task.Gara -> listOf("label:Race Tracker", "pkg:com.android.camera", "pkg:dji.go.v5", "label:RT Prova")
-        Task.Relax -> listOf("pkg:com.instagram.android", "pkg:com.apple.android.music", "pkg:com.google.android.youtube", "pkg:com.android.chrome")
+        Task.Ufficio -> listOf(
+            "label:AndreaOS", "pkg:com.google.android.gm", "pkg:com.google.android.apps.docs", "pkg:com.google.android.calendar",
+            "pkg:com.google.android.apps.docs.editors.docs", "pkg:com.google.android.apps.docs.editors.sheets",
+            "pkg:com.whatsapp", "pkg:com.whatsapp.w4b", "pkg:com.mi.android.globalFileexplorer", "pkg:com.android.chrome",
+        )
+        Task.Set -> listOf("pkg:com.android.camera", "pkg:dji.go.v5", "pkg:jp.co.sony.ips.portalapp", "pkg:com.miui.gallery", "pkg:com.google.android.apps.photos")
+        Task.Gara -> listOf("label:Race Tracker", "label:RT Prova", "pkg:com.android.camera", "pkg:dji.go.v5", "pkg:com.miui.gallery")
+        Task.Relax -> listOf(
+            "pkg:com.instagram.android", "pkg:com.apple.android.music", "pkg:com.google.android.youtube", "pkg:com.netflix.mediaclient",
+            "pkg:com.zhiliaoapp.musically", "pkg:com.facebook.katana", "pkg:com.android.chrome",
+        )
         Task.Auto -> emptyList()
     }
 
     private fun activityApps(t: Task): List<AppEntry> {
         val out = mutableListOf<AppEntry>()
+        val ess = pinned.value.toSet()
         if (task.value == Task.Auto) {
-            Usage.top(this, 2).forEach { pkg -> apps.value.firstOrNull { it.pkg == pkg }?.let { out += it } }
+            Usage.top(this, 4).forEach { pkg ->
+                if (pkg !in ess) apps.value.firstOrNull { it.pkg == pkg }?.let { out += it }
+            }
         }
-        defaults(t).forEach { spec -> find(spec)?.let { a -> if (out.none { it.pkg == a.pkg }) out += a } }
+        defaults(t).forEach { spec ->
+            find(spec)?.let { a -> if (a.pkg !in ess && out.none { it.pkg == a.pkg }) out += a }
+        }
         return out.take(4)
     }
 
@@ -566,7 +578,7 @@ class MainActivity : ComponentActivity() {
     private fun ActivityRow() {
         val tick = usageTick.intValue
         val (t, why) = resolveTask()
-        val list = remember(t, apps.value, tick) { activityApps(t) }
+        val list = remember(t, apps.value, pinned.value, tick) { activityApps(t) }
         val shape = RoundedCornerShape(20.dp)
         Column(
             Modifier
@@ -1002,14 +1014,20 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun AppMenu(a: AppEntry, open: Boolean, onDismiss: () -> Unit) {
-        DropdownMenu(expanded = open, onDismissRequest = onDismiss) {
+        DropdownMenu(
+            expanded = open,
+            onDismissRequest = onDismiss,
+            shape = RoundedCornerShape(16.dp),
+            containerColor = Color(0xFF1C1C1F),
+            modifier = Modifier.border(1.dp, Color(0x1FFFFFFF), RoundedCornerShape(16.dp)),
+        ) {
             val isPinned = a.pkg in pinned.value
             DropdownMenuItem(
-                text = { Text(if (isPinned) "Rimuovi dagli essenziali" else "Aggiungi agli essenziali") },
+                text = { Text(if (isPinned) "Rimuovi dagli essenziali" else "Aggiungi agli essenziali", color = Ink, fontSize = 15.sp) },
                 onClick = { togglePin(a.pkg); onDismiss() },
             )
-            DropdownMenuItem(text = { Text("Info app") }, onClick = { appInfo(a.pkg); onDismiss() })
-            DropdownMenuItem(text = { Text("Disinstalla") }, onClick = { uninstall(a.pkg); onDismiss() })
+            DropdownMenuItem(text = { Text("Info app", color = Ink, fontSize = 15.sp) }, onClick = { appInfo(a.pkg); onDismiss() })
+            DropdownMenuItem(text = { Text("Disinstalla", color = Color(0xFFFF8A80), fontSize = 15.sp) }, onClick = { uninstall(a.pkg); onDismiss() })
         }
     }
 
